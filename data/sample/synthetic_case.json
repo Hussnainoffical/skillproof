@@ -1,0 +1,10 @@
+{
+  "notice": "Fictional walkthrough fixture only; no real person, institution, document, or qualification is represented.",
+  "case_title": "Synthetic qualification review",
+  "occupation": "Renewable energy technician (fictional)",
+  "jurisdiction": "Germany — demo only",
+  "source_country": "Exampleland (fictional)",
+  "differences": [
+    {"field": "institution", "document_a": "synthetic-award-letter.txt", "value_a": "Alpine Technical Institute", "document_b": "synthetic-training-record.txt", "value_b": "Alpine Technical Institute West", "note": "The demo includes intentionally different fictional label values. The prompt is not asserted to be a conflict or an error."}
+  ]
+}

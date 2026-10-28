@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f7f8fb">
+  <meta name="description" content="A local-first workspace for preparing page-linked qualification evidence for human review.">
+  <title>SkillProof — Evidence review workspace</title>
+  <link rel="stylesheet" href="/static/styles.css">
+  <link rel="stylesheet" href="/static/overrides.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="Workspace navigation">
+      <a class="brand" href="/" aria-label="SkillProof home">
+        <span class="brand-mark"><svg viewBox="0 0 32 32" aria-hidden="true"><path d="M16 3.5 27 8v7.7c0 6.1-4.1 10.3-11 12.8C9.1 26 5 21.8 5 15.7V8l11-4.5Z"/><path d="m10.8 16.1 3.4 3.4 7-7"/></svg></span>
+        <span class="brand-name">skill<span>proof</span><small>Evidence workspace</small></span>
+      </a>
+
+      <div class="workspace-switcher"><span class="workspace-icon">W</span><span><b>Local workspace</b><small>Private to this device</small></span><span class="chevron">⌄</span></div>
+
+      <div class="side-label-row"><span class="side-label">CASES</span><button id="newCaseBtn" class="icon-button" aria-label="Create case" title="Create case">+</button></div>
+      <nav id="caseList" class="case-list" aria-label="Cases"><div class="loading-line">Loading cases…</div></nav>
+
+      <div class="sidebar-bottom">
+        <div class="local-note"><span class="lock-icon">▣</span><span><b>Stored on this device</b><small>Files stay in the local data folder.</small></span></div>
+        <a class="side-link" href="/api/docs" target="_blank" rel="noreferrer"><span>⌘</span> API reference <span class="external">↗</span></a>
+        <div class="profile-row"><div class="avatar">SP</div><span><b>Local reviewer</b><small>Single-user mode</small></span><span class="more">···</span></div>
+      </div>
+    </aside>
+
+    <main class="main-area">
+      <header class="topbar">
+        <div class="breadcrumbs"><span>Workspace</span><span class="crumb-sep">/</span><b id="crumbTitle">Overview</b></div>
+        <div class="top-actions"><span class="local-status"><i></i> Local only</span><button class="help-button" id="helpBtn">How it works <span>↗</span></button></div>
+      </header>
+      <section id="workspace" class="workspace" aria-live="polite"><div class="loading-state"><div class="spinner"></div><p>Opening your workspace…</p></div></section>
+      <footer class="app-footer"><span>SkillProof <span id="appVersion">0.1</span></span><span>Evidence preparation for human review · No equivalence or hiring decisions</span></footer>
+    </main>
+  </div>
+
+  <dialog id="caseDialog" class="modal">
+    <form id="caseForm" class="modal-card">
+      <div class="modal-heading"><div><span class="eyebrow">NEW CASE</span><h2>Set up a review</h2><p>Use a case label. Avoid personal identifiers unless you have permission.</p></div><button type="button" class="icon-button close-modal" data-close aria-label="Close">×</button></div>
+      <label>Case label<input name="title" required maxlength="160" placeholder="e.g. Qualification packet — case 042"></label>
+      <div class="form-grid"><label>Occupation<input name="occupation" maxlength="160" placeholder="e.g. Electrical technician"></label><label>Jurisdiction<input name="jurisdiction" maxlength="120" value="Germany"></label></div>
+      <div class="form-grid"><label>Country of training<input name="source_country" maxlength="120" placeholder="Country"></label><label>Recognition route<input name="route" maxlength="200" placeholder="Add after checking the official source"></label></div>
+      <div class="modal-actions"><button type="button" class="button button-quiet" data-close>Cancel</button><button class="button button-primary" type="submit">Create case <span>→</span></button></div>
+    </form>
+  </dialog>
+
+  <dialog id="requirementDialog" class="modal">
+    <form id="requirementForm" class="modal-card">
+      <div class="modal-heading"><div><span class="eyebrow">CASE CHECKLIST</span><h2>Add a requirement</h2><p>Copy it from the responsible authority and record when you checked it.</p></div><button type="button" class="icon-button close-modal" data-close aria-label="Close">×</button></div>
+      <label>Requirement title<input name="title" required maxlength="240" placeholder="e.g. Qualification certificate"></label>
+      <div class="form-grid"><label>Reference code<input name="code" maxlength="60" placeholder="Optional"></label><label>Source name<input name="source_name" maxlength="200" placeholder="Responsible authority"></label></div>
+      <label>Official source URL<input name="source_url" type="url" maxlength="1000" placeholder="https://…"></label>
+      <div class="form-grid"><label>Last checked<input name="source_checked_at" type="date"></label><label class="check-label"><input name="required" type="checkbox" checked> Required for this case</label></div>
+      <label>Reviewer guidance<textarea name="guidance" rows="3" maxlength="2000" placeholder="Describe what the source says. Keep the source-specific wording and limitations."></textarea></label>
+      <div class="modal-actions"><button type="button" class="button button-quiet" data-close>Cancel</button><button class="button button-primary" type="submit">Add to checklist <span>→</span></button></div>
+    </form>
+  </dialog>
+
+  <dialog id="historyDialog" class="modal">
+    <div class="modal-card"><div class="modal-heading"><div><span class="eyebrow">SOURCE HISTORY</span><h2>Requirement versions</h2><p>Evidence remains attached to the exact requirement version used at capture.</p></div><button type="button" class="icon-button close-modal" data-close aria-label="Close">×</button></div><div id="historyContent" class="version-history"></div><div class="modal-actions"><button class="button button-primary" data-close>Done</button></div></div>
+  </dialog>
+
+  <dialog id="helpDialog" class="modal">
+    <div class="modal-card help-card"><div class="modal-heading"><div><span class="eyebrow">A HUMAN-REVIEW WORKFLOW</span><h2>How SkillProof works</h2></div><button type="button" class="icon-button close-modal" data-close aria-label="Close">×</button></div>
+      <ol class="help-steps"><li><b>Set your source.</b><span>Choose a case and add requirements from a current official checklist.</span></li><li><b>Inspect the original.</b><span>Upload a permitted PDF or image. Extracted text and OCR are suggestions only.</span></li><li><b>Link evidence.</b><span>Capture a short exact excerpt with its source page. Correct and verify it yourself.</span></li><li><b>Prepare a packet.</b><span>Export a reviewer summary with requirement sources, page-linked evidence, and unresolved items.</span></li></ol>
+      <div class="boundary-callout"><b>What it does not decide</b><p>SkillProof does not authenticate a credential, determine equivalence or immigration eligibility, rank people, or recommend hiring decisions. Missing text is never a fraud finding.</p></div>
+      <div class="modal-actions"><button class="button button-primary" data-close>Got it</button></div>
+    </div>
+  </dialog>
+
+  <div id="toastRegion" class="toast-region" role="status" aria-live="polite"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

@@ -26,6 +26,12 @@ The next review found that the upload body could be spooled before the endpoint 
 
 Verification for this increment: `python -m pytest -q` — 17 passed; `python -m compileall -q src tests`; `node --check src/skillproof/static/app.js`; `python -m pip check`. These tests validate local correctness only; they are not adversarial parser fuzzing, a legal/privacy review, or a scale benchmark. See [edge cases and unresolved production gaps](EDGE_CASES_AND_GAPS.md) for the next risk-based work list.
 
+## Phase 3.2 — source-grounded local AI analyst
+
+Added an optional case-level question workflow backed by SQLite FTS5 page search and a local Ollama model. Retrieval is case-scoped, capped at eight pages and 6,000 characters per page; model concurrency is bounded. No model is bundled and no cloud endpoint is used. Structured responses can cite only retrieved page IDs, and the server removes any citation with a quote that does not occur in the referenced page. If no citation survives validation, the model summary is withheld. The UI links citations back to the source inspector and labels all output provisional. AI suggestions do not create evidence and cannot decide legal eligibility, credential equivalence, authenticity, fraud, or hiring.
+
+This machine did not have Ollama or a local model installed, so live inference was not available. API behavior was exercised with a mocked model response, including a fabricated page citation; the fabricated citation was discarded. Verification: `python -m pytest` — 20 passed; Python compile check and `node --check` passed; `git diff --check` clean. This does not establish model accuracy, multilingual quality, privacy under a real deployment, or high-load capacity. Setup and limits are in [README](../README.md#optional-local-ai-analyst) and [operations](OPERATIONS.md).
+
 ## Phase 4 — next increments
 
 Before a real-data pilot: recruit advisers, identify one occupation/state/source-country route, verify source checklists with an authority or qualified adviser, label a diverse evaluation corpus, review privacy/legal classification, add authentication and tenant isolation if collaboration is required, encrypt stored data, sandbox parsing, and benchmark representative large files. Kill or pivot if existing tools already solve the workflow or no buyer commits to a safe pilot.

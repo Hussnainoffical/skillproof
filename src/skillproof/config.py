@@ -32,3 +32,9 @@ OCR_TIMEOUT_SECONDS = max(1, int(os.environ.get("SKILLPROOF_OCR_TIMEOUT_SECONDS"
 def ensure_data_dirs() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Optional local-only AI. Empty model disables generation without affecting core workflows.
+OLLAMA_URL = os.environ.get("SKILLPROOF_OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+OLLAMA_MODEL = os.environ.get("SKILLPROOF_OLLAMA_MODEL", "").strip()
+OLLAMA_TIMEOUT_SECONDS = max(5, int(os.environ.get("SKILLPROOF_OLLAMA_TIMEOUT_SECONDS", 120)))
+AI_MAX_CONCURRENT_REQUESTS = max(1, min(4, int(os.environ.get("SKILLPROOF_AI_MAX_CONCURRENT_REQUESTS", 2))))

@@ -21,6 +21,12 @@
 | `SKILLPROOF_OCR_TIMEOUT_SECONDS` | 60 | Maximum time for one Tesseract page call |
 | `SKILLPROOF_OCR` | `0` | Enable local OCR when set to `1` |
 | `SKILLPROOF_OCR_LANGS` | `eng` | Installed Tesseract language codes, e.g. `deu+eng` |
+| `SKILLPROOF_OLLAMA_URL` | `http://127.0.0.1:11434` | Loopback Ollama service URL; remote endpoints are rejected |
+| `SKILLPROOF_OLLAMA_MODEL` | unset | Exact local Ollama model name; unset disables AI |
+| `SKILLPROOF_OLLAMA_TIMEOUT_SECONDS` | `120` | Maximum model response wait |
+| `SKILLPROOF_AI_MAX_CONCURRENT_REQUESTS` | `2` | Maximum concurrent local AI analyses (capped at 4) |
+
+To enable the optional analyst, install Ollama, pull a model that fits device resources (e.g. `ollama pull qwen3:8b`), then set `SKILLPROOF_OLLAMA_MODEL` to the installed model name and restart. `/api/ai/status` reports availability. Retrieval uses up to eight case-scoped pages (up to 6,000 characters each), while model calls run through a bounded local semaphore. Citation checks confirm the returned quote occurs on the referenced retrieved page; they do not guarantee interpretation accuracy. No cloud model or fallback is used. The CPU/GPU model's memory consumption is outside SkillProof's queue bound.
 
 Keep the app bound to `127.0.0.1`. Do not use `--host 0.0.0.0` for real case data.
 

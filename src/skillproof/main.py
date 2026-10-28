@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 
 from .config import MAX_CASE_STORAGE_BYTES, MAX_CONCURRENT_UPLOAD_REQUESTS, MAX_DISCREPANCY_SCAN_PAGES, MAX_DOCUMENTS_PER_CASE, MAX_EVIDENCE_PER_CASE, MAX_REQUIREMENTS_PER_CASE, MAX_TOTAL_STORAGE_BYTES, MAX_UPLOAD_BYTES, UPLOAD_DIR, WORKERS, ensure_data_dirs
 from .db import connection, initialize, row_dict
+from . import ai
 from .processing import now_iso, page_suggestions, process_document
 
 
@@ -60,6 +61,11 @@ class EvidenceReview(BaseModel):
 
 class CaseUpdate(BaseModel):
     status: Literal["open", "review", "ready", "archived"]
+
+
+class AIAnalysisRequest(BaseModel):
+    question: str = Field(min_length=3, max_length=1200)
+    requirement_id: str | None = None
 
 
 def _require_case(case_id: str) -> dict:
@@ -334,6 +340,17 @@ async def local_security_headers(request: Request, call_next):
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 def index() -> FileResponse:
     return FileResponse(Path(__file__).parent / "static" / "index.html")
+
+
+@app.get("/api/ai/status", tags=["ai"])
+def ai_status() -> dict:
+    return ai.status()
+
+
+@app.post("/api/cases/{case_id}/ai/analyze", tags=["ai"])
+def analyze_case(case_id: str, payload: AIAnalysisRequest) -> dict:
+    _require_case(case_id)
+    return ai.analyze(case_id, payload.question.strip(), payload.requirement_id)
 
 
 @app.get("/api/health", tags=["system"])

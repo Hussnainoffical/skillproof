@@ -6,11 +6,12 @@
 Browser (same-origin, loopback)
   ├─ Case/checklist/review UI ── FastAPI JSON API
   ├─ Source PDF/image viewer ─── local upload endpoint
+  ├─ AI analyst ─────────────── bounded FTS5 retrieval → local Ollama
   └─ Markdown packet export ─── deterministic renderer
                                   │
                           SQLite (WAL, foreign keys)
                      cases / requirements / documents
-                     page text / regions / tables / evidence
+                     page text / FTS5 index / regions / tables / evidence
                      jobs / audit events
                                   │
                      bounded local worker pool
@@ -24,6 +25,12 @@ The application writes only under its configured project-local data directory. D
 SQLite foreign keys connect a case to versioned requirement records, documents, source pages/layout regions, human-created evidence excerpts, reviewer dispositions, jobs, and audit events. A stable chain key and partial unique index prevent two current revisions from existing in the same checklist lineage; revision writes use an immediate transaction to serialize concurrent edits. Evidence excerpts must match the selected extracted page text. Provenance differentiates system keyword suggestions from human-observed and human-reviewed items. A reviewer disposition does not mean a competent authority has recognized a qualification.
 
 The local deterministic discrepancy check only compares exact, label-keyed fields (for example, `Institution:`) across files. It returns source-linked prompts. It does not infer identity, truth, authenticity, fraud, or equivalence. Unstructured disagreements and unlabeled data can be missed.
+
+## Optional local AI analyst
+
+SQLite FTS5 indexes one row per extracted page; insert, update, and delete triggers keep the index aligned with page records, and startup rebuilds it from canonical page text. Analysis scopes retrieval to the requested case and ready/partial/OCR pages, limits context to eight pages × 6,000 characters, and caps simultaneous local model calls. Search uses tokenized, quoted FTS terms rather than accepting raw FTS syntax from a user. The optional Ollama integration accepts loopback HTTP only and uses the structured-output `/api/chat` endpoint; see the [Ollama chat API](https://docs.ollama.com/api/chat). There is no cloud fallback.
+
+The system prompt separates untrusted page text from analyst instructions, and the response schema restricts citation fields. The server independently checks every returned page ID and exact whitespace-normalized quote against that retrieved page before showing it. Unsupported citations are removed and counted. This validates citation membership, not whether a model's interpretation is correct, complete, or non-hallucinatory. AI results remain provisional; no results are written to evidence or used for decisions. See [local operations](OPERATIONS.md) for configuration and limitations.
 
 ## Large-file behavior
 
@@ -48,4 +55,4 @@ Those components are a scale design direction, not a claim that one million user
 - Local storage avoids sending personal documents to model APIs but does not encrypt SQLite or protect a compromised workstation.
 - `pypdf` extracts digital PDF text and visitor fragments; the stored region geometry is an approximate locator, not a pixel-accurate box. Whitespace-based digital table candidates are heuristic. Scanned tables need visual/manual review.
 - OCR is opt-in and requires a local Tesseract binary plus optional Python dependencies; OCR of scanned PDF pages also uses optional PyMuPDF for rendering. OCR quality depends on language packs and scan quality.
-- No LLM is required for this MVP. That reduces unsupported generation risk; richer extraction should be introduced only behind provenance, evaluation, and human correction.
+- Local AI analysis is optional, bounded, and source-cited; citation matching does not itself establish semantic correctness. Model quality, language coverage, OCR quality, and workload capacity require separate evaluation.

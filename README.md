@@ -25,7 +25,7 @@ python -m pip install -e .
 uvicorn skillproof.main:app --app-dir src --host 127.0.0.1 --port 8787
 ```
 
-The API reference is at `/api/docs`. Runtime documents and the SQLite database live in `data/runtime/` by default and are git-ignored. Back up or delete that folder deliberately. The app does not upload files to a model provider or analytics service.
+The API reference is at `/api/docs`. Runtime documents and the SQLite database live in `data/runtime/` by default and are git-ignored. Back up or delete that folder deliberately. The app does not upload files to a cloud model provider or analytics service. Optional AI analysis uses a separately installed local Ollama server only; no model is configured by default.
 
 ## First-time demo
 
@@ -38,7 +38,20 @@ Select **Explore with synthetic data** to create a fictional case with made-up d
 3. Upload a consented PDF or image. The local worker extracts page text, approximate layout-region locators, and heuristic digital-table candidates. Processing runs asynchronously and is bounded by configured size/page/text limits.
 4. Inspect the original page. Capture an exact excerpt and attach it to a requirement. Keyword suggestions and cross-document text differences are prompts, not verdicts.
 5. Record a human disposition (supports, conflicts, needs expert, not relevant) with an optional note.
-6. Export a Markdown packet that preserves source links, excerpts, page numbers, and reviewer decisions.
+6. Ask the optional **AI evidence analyst** a case question. It retrieves at most eight matching source pages from a SQLite FTS5 index, sends only bounded excerpts to a loopback Ollama model, and discards citations whose exact quote cannot be checked against the selected page. Inspect cited originals and make every decision yourself.
+7. Export a Markdown packet that preserves source links, excerpts, page numbers, and reviewer decisions.
+
+## Optional local AI analyst
+
+Install and start [Ollama](https://ollama.com/download), download a model that fits your machine (for example, `ollama pull qwen3:8b`), then configure its exact model name before starting SkillProof:
+
+```powershell
+$env:SKILLPROOF_OLLAMA_MODEL="qwen3:8b"
+$env:SKILLPROOF_OLLAMA_TIMEOUT_SECONDS="120"
+skillproof
+```
+
+The analyst is disabled if no model is configured. It only accepts an unauthenticated HTTP Ollama endpoint on `localhost`, `127.0.0.1`, or `::1`; `SKILLPROOF_OLLAMA_URL` defaults to `http://127.0.0.1:11434`. It retrieves up to eight matching pages and sends no more than 6,000 characters per page, with a bounded analysis queue. The model is prompted to treat source content as untrusted data and to avoid legal, authenticity, equivalence, fraud, identity, and hiring conclusions. Every output citation must name a retrieved page and contain a quote found in that page text; unsupported citations are removed. This is a source-grounding check, not a guarantee of answer correctness. No cloud fallback is used. Local inference still consumes device memory and may be slow; assess the model, language coverage, and evaluation corpus before relying on it.
 
 ## OCR and scanned documents
 

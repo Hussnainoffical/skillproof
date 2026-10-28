@@ -110,6 +110,17 @@ CREATE INDEX IF NOT EXISTS idx_evidence_case_disposition ON evidence(case_id,dis
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state, created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_case ON audit_events(case_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_cases_updated ON cases(updated_at DESC);
+CREATE VIRTUAL TABLE IF NOT EXISTS page_search USING fts5(page_id UNINDEXED, document_id UNINDEXED, page_number UNINDEXED, text, tokenize='unicode61 remove_diacritics 2');
+CREATE TRIGGER IF NOT EXISTS pages_search_insert AFTER INSERT ON pages BEGIN
+  INSERT INTO page_search(page_id,document_id,page_number,text) VALUES(new.id,new.document_id,new.page_number,new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS pages_search_delete AFTER DELETE ON pages BEGIN
+  DELETE FROM page_search WHERE page_id=old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS pages_search_update AFTER UPDATE ON pages BEGIN
+  DELETE FROM page_search WHERE page_id=old.id;
+  INSERT INTO page_search(page_id,document_id,page_number,text) VALUES(new.id,new.document_id,new.page_number,new.text);
+END;
 """
 
 
@@ -119,6 +130,7 @@ def connection() -> Iterator[sqlite3.Connection]:
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA recursive_triggers = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
     try:
         yield conn
@@ -175,6 +187,8 @@ def initialize() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_requirements_current ON requirements(case_id,is_current)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_requirements_chain ON requirements(chain_id,version)")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_requirements_one_current_per_chain ON requirements(chain_id) WHERE is_current=1")
+        # Backfill rows missing from the FTS index without rebuilding large workspaces.
+        conn.execute("INSERT INTO page_search(page_id,document_id,page_number,text) SELECT p.id,p.document_id,p.page_number,p.text FROM pages p WHERE NOT EXISTS (SELECT 1 FROM page_search s WHERE s.page_id=p.id)")
 
 
 def row_dict(row: sqlite3.Row | None) -> dict | None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 import sqlite3
 import uuid
@@ -11,7 +12,7 @@ from pathlib import Path
 
 from pypdf import PdfReader
 
-from .config import MAX_EXTRACTED_CHARS, MAX_IMAGE_PIXELS, MAX_PAGE_CHARS, MAX_PAGES, OCR_ENABLED, OCR_LANGUAGES, UPLOAD_DIR
+from .config import MAX_EXTRACTED_CHARS, MAX_IMAGE_PIXELS, MAX_PAGE_CHARS, MAX_PAGES, OCR_ENABLED, OCR_LANGUAGES, OCR_TIMEOUT_SECONDS, UPLOAD_DIR
 from .db import connection
 
 
@@ -56,15 +57,16 @@ def _optional_ocr(path: Path, page_index: int | None, media_type: str, existing:
             import fitz  # optional local renderer, installed with the [ocr] extra
             with fitz.open(path) as source:
                 page = source.load_page(page_index)
-                pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
-                if pix.width * pix.height > MAX_IMAGE_PIXELS:
+                scale = 1.5
+                if math.ceil(page.rect.width * scale) * math.ceil(page.rect.height * scale) > MAX_IMAGE_PIXELS:
                     return existing, False
+                pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
                 image = Image.open(io.BytesIO(pix.tobytes("png")))
         else:
             image = Image.open(path)
             if image.width * image.height > MAX_IMAGE_PIXELS:
                 return existing, False
-        return pytesseract.image_to_string(image, lang=OCR_LANGUAGES), True
+        return pytesseract.image_to_string(image, lang=OCR_LANGUAGES, timeout=OCR_TIMEOUT_SECONDS), True
     except Exception:
         return existing, False
 
@@ -87,7 +89,12 @@ def _layout_tables(text: str, page_number: int) -> list[dict]:
 
 
 def _region_visitor(regions: list[dict], page_number: int):
+    retained_chars = 0
+
     def visit(text, cm, tm, font_dict, font_size):
+        nonlocal retained_chars
+        if len(regions) >= 200 or retained_chars >= 20_000:
+            return
         clean = " ".join(str(text).split())
         if not clean:
             return
@@ -97,7 +104,9 @@ def _region_visitor(regions: list[dict], page_number: int):
             # pypdf's text matrix coordinates are a locator approximation in PDF user space,
             # not pixel-exact bounding boxes. The original viewer remains authoritative.
             width = max(size, min(len(clean) * size * 0.5, 2000))
-            regions.append({"id": f"p{page_number}-r{len(regions)+1}", "bbox": [round(x, 2), round(y-size, 2), round(x+width, 2), round(y+size*0.2, 2)], "coordinate_space": "pdf_user_space_approximate", "text": clean[:4000]})
+            clean = clean[: min(1000, 20_000 - retained_chars)]
+            regions.append({"id": f"p{page_number}-r{len(regions)+1}", "bbox": [round(x, 2), round(y-size, 2), round(x+width, 2), round(y+size*0.2, 2)], "coordinate_space": "pdf_user_space_approximate", "text": clean})
+            retained_chars += len(clean)
         except Exception:
             return
     return visit
@@ -124,6 +133,7 @@ def process_document(document_id: str, job_id: str) -> None:
 
     batch: list[dict] = []
     page_count = 0
+    processed_pages = 0
     extracted_chars = 0
     ocr_count = 0
     partial = False
@@ -146,6 +156,7 @@ def process_document(document_id: str, job_id: str) -> None:
                 with connection() as conn:
                     conn.execute("UPDATE jobs SET progress_total=?,updated_at=? WHERE id=?", (page_count, now_iso(), job_id))
                 for index, page in enumerate(reader.pages, start=1):
+                    processed_pages = index
                     regions: list[dict] = []
                     text = page.extract_text(visitor_text=_region_visitor(regions, index)) or ""
                     text, used_ocr = _optional_ocr(path, index - 1, media_type, text)
@@ -168,13 +179,18 @@ def process_document(document_id: str, job_id: str) -> None:
                     if extracted_chars >= MAX_EXTRACTED_CHARS:
                         partial = index < page_count or partial
                         break
+                if batch:
+                    with connection() as conn:
+                        _insert_pages(conn, batch)
+                        conn.execute("UPDATE jobs SET progress_current=?,updated_at=? WHERE id=?", (processed_pages, now_iso(), job_id))
+                    batch.clear()
         else:
             text, used_ocr = _optional_ocr(path, None, media_type, "")
-            if not text.strip() and not used_ocr:
-                raise ValueError("OCR_UNAVAILABLE_OR_EMPTY")
-            page_count, extracted_chars, ocr_count = 1, len(text[:MAX_PAGE_CHARS]), int(used_ocr)
-            if len(text) > MAX_PAGE_CHARS:
-                text, partial = text[:MAX_PAGE_CHARS], True
+            page_count, processed_pages, ocr_count = 1, 1, int(used_ocr)
+            text_limit = min(MAX_PAGE_CHARS, MAX_EXTRACTED_CHARS)
+            extracted_chars = min(len(text), text_limit)
+            if len(text) > text_limit:
+                text, partial = text[:text_limit], True
             batch.append(_page_record(document_id, 1, text, [], [], used_ocr))
             with connection() as conn:
                 _insert_pages(conn, batch)
@@ -183,7 +199,7 @@ def process_document(document_id: str, job_id: str) -> None:
         state = "partial" if partial else ("needs_ocr" if extracted_chars == 0 else "ready")
         with connection() as conn:
             conn.execute("UPDATE documents SET status=?,page_count=?,extracted_chars=? WHERE id=?", (state, page_count, extracted_chars, document_id))
-            conn.execute("UPDATE jobs SET state='complete',progress_current=?,progress_total=?,updated_at=? WHERE id=?", (min(page_count, conn.execute("SELECT progress_total FROM jobs WHERE id=?", (job_id,)).fetchone()[0]), page_count, now_iso(), job_id))
+            conn.execute("UPDATE jobs SET state='complete',progress_current=?,progress_total=?,updated_at=? WHERE id=?", (processed_pages, page_count, now_iso(), job_id))
             conn.execute("INSERT INTO audit_events(id,case_id,action,object_type,object_id,details_json,created_at) SELECT ?,case_id,'document.processed','document',?,json_object('status',?,'page_count',?,'ocr_pages',?),? FROM documents WHERE id=?", (str(uuid.uuid4()), document_id, state, page_count, ocr_count, now_iso(), document_id))
     except Exception as exc:
         code = str(exc) if isinstance(exc, ValueError) else "DOCUMENT_PARSE_FAILED"

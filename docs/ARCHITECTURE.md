@@ -17,11 +17,11 @@ Browser (same-origin, loopback)
                      pypdf extraction + optional local OCR
 ```
 
-The application writes only under its configured project-local data directory. Documents use UUID storage names and retain a sanitized display filename. Uploads are type/signature checked, size limited, hashed, and duplicate checked within the case. PDF pages are parsed incrementally and committed in batches. The original remains the primary evidence; extracted text does not replace it.
+The application writes only under its configured project-local data directory. Documents use UUID storage names and retain a sanitized display filename. Uploads are type/signature checked, size limited, hashed, and duplicate checked within the case. An ASGI request-body guard rejects oversized multipart bodies before framework disk spooling; the endpoint then streams the file in bounded chunks. Queue admission is serialized with a SQLite write lock so concurrent uploads cannot all pass the same stale queue check. PDF pages are parsed incrementally and committed in batches. Per-page layout hints have explicit count and text limits. The original remains the primary evidence; extracted text does not replace it.
 
 ## Evidence graph and provenance
 
-SQLite foreign keys connect a case to versioned requirement records, documents, source pages/layout regions, human-created evidence excerpts, reviewer dispositions, jobs, and audit events. Evidence excerpts must match the selected extracted page text. Provenance differentiates system keyword suggestions from human-observed and human-reviewed items. A reviewer disposition does not mean a competent authority has recognized a qualification.
+SQLite foreign keys connect a case to versioned requirement records, documents, source pages/layout regions, human-created evidence excerpts, reviewer dispositions, jobs, and audit events. A stable chain key and partial unique index prevent two current revisions from existing in the same checklist lineage; revision writes use an immediate transaction to serialize concurrent edits. Evidence excerpts must match the selected extracted page text. Provenance differentiates system keyword suggestions from human-observed and human-reviewed items. A reviewer disposition does not mean a competent authority has recognized a qualification.
 
 The local deterministic discrepancy check only compares exact, label-keyed fields (for example, `Institution:`) across files. It returns source-linked prompts. It does not infer identity, truth, authenticity, fraud, or equivalence. Unstructured disagreements and unlabeled data can be missed.
 

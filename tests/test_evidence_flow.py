@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import sqlite3
 import time
+import asyncio
+import uuid
 
 import pytest
 from fastapi.testclient import TestClient
@@ -100,21 +102,37 @@ def test_local_pdf_to_human_review_and_export(client):
     })
     assert evidence.status_code == 201
     assert evidence.json()["provenance"] == "human_observed"
+    duplicate_evidence = client.post(f"/api/cases/{case_id}/evidence", json={
+        "requirement_id": requirement_id, "document_id": document_id, "page_number": 1,
+        "claim_type": "qualification", "claim_text": "Award: Diploma in Energy Systems", "region_id": suggestion["region_id"], "provenance": "human_observed"
+    })
+    assert duplicate_evidence.status_code == 409
     reviewed = client.patch(f"/api/evidence/{evidence.json()['id']}", json={"disposition": "supports", "reviewer_note": "Checked against synthetic source page."})
     assert reviewed.status_code == 200
     assert reviewed.json()["provenance"] == "human_verified"
+    reopened = client.patch(f"/api/evidence/{evidence.json()['id']}", json={"disposition": "unreviewed"})
+    assert reopened.json()["provenance"] == "human_observed"
+    assert reopened.json()["reviewer_note"] == "Checked against synthetic source page."
+    reviewed = client.patch(f"/api/evidence/{evidence.json()['id']}", json={"disposition": "supports"})
+    assert reviewed.json()["reviewer_note"] == "Checked against synthetic source page."
 
     revised = client.put(f"/api/requirements/{requirement_id}", json={
         "title": "Certificate and award date", "source_name": "Updated synthetic checklist", "source_checked_at": "2026-10-29", "guidance": "Rechecked in the synthetic test."
     })
     assert revised.status_code == 201
     assert revised.json()["version"] == 2
+    revised_again = client.put(f"/api/requirements/{revised.json()['id']}", json={
+        "title": "Certificate and award date", "source_name": "Third synthetic checklist", "source_checked_at": "2026-10-30", "guidance": "Rechecked for chain test."
+    })
+    assert revised_again.status_code == 201
+    assert revised_again.json()["version"] == 3
     history = client.get(f"/api/requirements/{revised.json()['id']}/history")
     assert history.status_code == 200
-    assert [version["version"] for version in history.json()] == [1, 2]
+    assert [version["version"] for version in history.json()] == [1, 2, 3]
     current = client.get(f"/api/cases/{case_id}").json()
-    assert current["requirements"][0]["version"] == 2
+    assert current["requirements"][0]["version"] == 3
     assert current["evidence"][0]["requirement_version"] == 1
+    assert next(item for item in client.get("/api/cases").json() if item["id"] == case_id)["requirement_count"] == 1
 
     packet = client.get(f"/api/cases/{case_id}/packet.md")
     assert packet.status_code == 200
@@ -151,6 +169,13 @@ def test_evidence_quote_must_be_on_selected_page(client):
     assert response.status_code == 422
 
 
+def test_requirement_source_url_rejects_invalid_hosts_credentials_and_malformed_ipv6(client):
+    case_id = client.post("/api/cases", json={"title": "Source URL validation"}).json()["case"]["id"]
+    for source_url in ("https:///missing-host", "https://reviewer:secret@example.org/checklist", "http://[::1", "https://example.org:99999", "https://example.org\\path"):
+        response = client.post(f"/api/cases/{case_id}/requirements", json={"title": "Synthetic requirement", "source_url": source_url})
+        assert response.status_code == 422
+
+
 def test_synthetic_demo_is_marked_and_discrepancy_is_only_a_prompt(client):
     response = client.post("/api/demo")
     assert response.status_code == 201
@@ -160,6 +185,21 @@ def test_synthetic_demo_is_marked_and_discrepancy_is_only_a_prompt(client):
     checks = client.get(f"/api/cases/{case_id}/checks").json()
     assert "not establish" in checks["notice"]
     assert any(item["field"] == "institution" for item in checks["potential_discrepancies"])
+    first_page = client.get(f"/api/cases/{case_id}/evidence?offset=0&limit=2").json()
+    cursor = first_page["next_cursor"]
+    next_page = client.get(f"/api/cases/{case_id}/evidence", params={"limit": 2, "before_created_at": cursor["created_at"], "before_id": cursor["id"]}).json()
+    assert first_page["total"] == 3 and len(first_page["items"]) == 2
+    assert next_page["total"] == 3 and len(next_page["items"]) == 1
+    assert client.get(f"/api/cases/{case_id}/evidence?before_id=only-one-half").status_code == 422
+
+
+def test_cross_document_scan_discloses_when_page_budget_is_reached(client, monkeypatch):
+    monkeypatch.setattr(main, "MAX_DISCREPANCY_SCAN_PAGES", 1)
+    case_id = client.post("/api/demo").json()["case"]["id"]
+    result = client.get(f"/api/cases/{case_id}/checks").json()
+    assert result["pages_scanned"] == 1
+    assert result["partial_scan"] is True
+    assert "later pages were not checked" in result["notice"]
 
 
 def test_bad_file_signature_and_security_headers(client):
@@ -183,6 +223,17 @@ def test_whitespace_table_candidates_are_marked_as_heuristic():
     assert tables[0]["review_required"] is True
 
 
+def test_pdf_layout_region_hints_have_per_page_memory_bounds():
+    from skillproof.processing import _region_visitor
+
+    regions = []
+    visit = _region_visitor(regions, 1)
+    for _ in range(1000):
+        visit("X" * 3000, None, [0, 0, 0, 0, 1, 1], None, 10)
+    assert len(regions) <= 200
+    assert sum(len(region["text"]) for region in regions) <= 20_000
+
+
 def test_multi_batch_pdf_processing_persists_late_pages(client):
     case_id = client.post("/api/cases", json={"title": "Multi-page synthetic case"}).json()["case"]["id"]
     upload = client.post(f"/api/cases/{case_id}/documents", files={"file": ("large-synthetic.pdf", pdf_bytes("Award: Diploma in Energy Systems", page_count=63), "application/pdf")})
@@ -194,6 +245,18 @@ def test_multi_batch_pdf_processing_persists_late_pages(client):
     last_page = client.get(f"/api/documents/{document['id']}/pages/63")
     assert last_page.status_code == 200
     assert last_page.json()["page_number"] == 63
+
+
+def test_partial_extraction_reports_actual_page_progress(client, monkeypatch):
+    monkeypatch.setattr(processing, "MAX_EXTRACTED_CHARS", 5)
+    case_id = client.post("/api/cases", json={"title": "Budget boundary"}).json()["case"]["id"]
+    upload = client.post(f"/api/cases/{case_id}/documents", files={"file": ("budget.pdf", pdf_bytes("A long first page that exhausts the tiny budget", page_count=63), "application/pdf")})
+    result = wait_job(client, upload.json()["job_id"])
+    assert result["state"] == "complete"
+    assert result["progress_current"] == 1
+    assert result["progress_total"] == 63
+    detail = client.get(f"/api/cases/{case_id}").json()
+    assert detail["documents"][0]["status"] == "partial"
 
 
 def test_first_prototype_database_gets_requirement_history_columns(tmp_path, monkeypatch):
@@ -213,4 +276,113 @@ def test_first_prototype_database_gets_requirement_history_columns(tmp_path, mon
     db.initialize()
     with sqlite3.connect(database) as conn:
         columns = {row[1] for row in conn.execute("PRAGMA table_info(requirements)")}
-    assert {"version", "supersedes_id", "is_current"}.issubset(columns)
+    assert {"version", "chain_id", "supersedes_id", "is_current"}.issubset(columns)
+
+
+def test_queue_capacity_is_checked_atomically_before_accepting_file(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "WORKERS", 1)
+    case_id = client.post("/api/cases", json={"title": "Queue boundary"}).json()["case"]["id"]
+    with db.connection() as conn:
+        for _ in range(8):
+            document_id, job_id = str(uuid.uuid4()), str(uuid.uuid4())
+            conn.execute("INSERT INTO documents(id,case_id,original_name,storage_name,media_type,size_bytes,sha256,status,uploaded_at) VALUES(?,?,?,'',?,0,'','queued',?)", (document_id, case_id, "queued synthetic.pdf", "application/pdf", processing.now_iso()))
+            conn.execute("INSERT INTO jobs(id,document_id,state,created_at,updated_at) VALUES(?,?,'queued',?,?)", (job_id, document_id, processing.now_iso(), processing.now_iso()))
+    response = client.post(f"/api/cases/{case_id}/documents", files={"file": ("too-late.pdf", pdf_bytes("synthetic"), "application/pdf")})
+    assert response.status_code == 429
+    assert response.headers["retry-after"] == "15"
+    assert not list((tmp_path / "runtime" / "uploads").iterdir())
+
+
+def test_upload_stream_limit_rejects_chunked_body_before_form_spooling(monkeypatch):
+    from skillproof.main import UploadBodyLimitMiddleware
+
+    monkeypatch.setattr(UploadBodyLimitMiddleware, "multipart_overhead_bytes", 0)
+    sent = []
+    chunks = iter([{"type": "http.request", "body": b"1234", "more_body": True}])
+
+    async def receive():
+        return next(chunks)
+
+    async def send(message):
+        sent.append(message)
+
+    async def downstream(scope, receive, send):
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+
+    middleware = UploadBodyLimitMiddleware(downstream, max_file_bytes=3)
+    scope = {"type": "http", "method": "POST", "path": "/api/cases/case-1/documents", "headers": []}
+    asyncio.run(middleware(scope, receive, send))
+    assert sent[0]["status"] == 413
+
+
+def test_upload_middleware_caps_parallel_request_bodies():
+    from skillproof.main import UploadBodyLimitMiddleware
+
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        first_messages, second_messages = [], []
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def downstream(scope, receive, send):
+            entered.set()
+            await release.wait()
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"ok"})
+
+        async def send_first(message):
+            first_messages.append(message)
+
+        async def send_second(message):
+            second_messages.append(message)
+
+        middleware = UploadBodyLimitMiddleware(downstream, max_file_bytes=10, max_concurrent_uploads=1)
+        scope = {"type": "http", "method": "POST", "path": "/api/cases/case-1/documents", "headers": []}
+        first = asyncio.create_task(middleware(scope, receive, send_first))
+        await entered.wait()
+        await middleware(scope, receive, send_second)
+        release.set()
+        await first
+        assert second_messages[0]["status"] == 429
+        assert first_messages[0]["status"] == 200
+
+    asyncio.run(scenario())
+
+
+def test_per_case_document_quota_fails_cleanly(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "MAX_DOCUMENTS_PER_CASE", 1)
+    case_id = client.post("/api/cases", json={"title": "Storage quota"}).json()["case"]["id"]
+    first = client.post(f"/api/cases/{case_id}/documents", files={"file": ("first.pdf", pdf_bytes("First synthetic record"), "application/pdf")})
+    assert first.status_code == 202
+    wait_job(client, first.json()["job_id"])
+    second = client.post(f"/api/cases/{case_id}/documents", files={"file": ("second.pdf", pdf_bytes("Second, different record"), "application/pdf")})
+    assert second.status_code == 409
+    files = list((tmp_path / "runtime" / "uploads").iterdir())
+    assert len(files) == 1
+
+
+def test_legacy_requirement_revisions_receive_one_current_chain(tmp_path, monkeypatch):
+    data = tmp_path / "revision-runtime"
+    data.mkdir()
+    database = data / "revisions.sqlite3"
+    with sqlite3.connect(database) as conn:
+        conn.execute("""CREATE TABLE requirements (
+            id TEXT PRIMARY KEY, case_id TEXT NOT NULL, title TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1, supersedes_id TEXT NOT NULL DEFAULT '',
+            is_current INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL)""")
+        conn.executemany("INSERT INTO requirements(id,case_id,title,version,supersedes_id,is_current,created_at) VALUES(?,?,?,?,?,?,?)", [
+            ("req-v1", "case-1", "Requirement v1", 1, "", 1, "2026-01-01"),
+            ("req-v2", "case-1", "Requirement v2", 2, "req-v1", 1, "2026-01-02"),
+            ("req-other", "case-1", "Other requirement", 1, "", 1, "2026-01-03"),
+        ])
+    monkeypatch.setattr(config, "DATA_DIR", data)
+    monkeypatch.setattr(config, "UPLOAD_DIR", data / "uploads")
+    monkeypatch.setattr(config, "DB_PATH", database)
+    monkeypatch.setattr(db, "DB_PATH", database)
+    db.initialize()
+    with sqlite3.connect(database) as conn:
+        current = conn.execute("SELECT chain_id,count(*),min(id) FROM requirements WHERE is_current=1 GROUP BY chain_id ORDER BY chain_id").fetchall()
+    assert current == [("req-other", 1, "req-other"), ("req-v1", 1, "req-v2")]

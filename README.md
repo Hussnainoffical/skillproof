@@ -56,8 +56,8 @@ The PDF renderer uses OCR only for pages with little extractable text. Raster ou
 ## Limits and safe defaults
 
 - Single-user local prototype; no sign-in, team sharing, network service, or tenant boundary.
-- Default maximum upload size: 200 MiB; maximum PDF length: 10,000 pages; extracted text budget: 100 million characters per file; each stored page is capped at 100,000 characters. Configure using `SKILLPROOF_MAX_UPLOAD_BYTES`, `SKILLPROOF_MAX_PAGES`, `SKILLPROOF_MAX_EXTRACTED_CHARS`, and `SKILLPROOF_MAX_PAGE_CHARS`.
-- Two local processing workers by default (`SKILLPROOF_WORKERS`). These limits prevent unbounded work; they do not demonstrate capacity for 1,000,000 concurrent users.
+- Default maximum upload size: 200 MiB; multipart request cap adds at most 128 KiB framing; maximum PDF length: 10,000 pages; extracted text budget: 100 million characters per file; each stored page is capped at 100,000 characters. Configure using `SKILLPROOF_MAX_UPLOAD_BYTES`, `SKILLPROOF_MAX_PAGES`, `SKILLPROOF_MAX_EXTRACTED_CHARS`, and `SKILLPROOF_MAX_PAGE_CHARS`.
+- Two local processing workers by default (`SKILLPROOF_WORKERS`); at most `max(8, 4 × workers)` jobs may be queued or running. Up to four upload request bodies are accepted concurrently. Defaults also limit a case to 100 files/2 GiB, 500 current requirements, and 100,000 evidence items; the workspace file budget is 10 GiB. These limits do not demonstrate capacity for 1,000,000 concurrent users.
 - SQLite is not encrypted by the app. Use device encryption and access controls; do not use real applicant documents until data protection, retention, access, and legal review are complete.
 - Delete a case to remove its records and uploaded files. Deleting a document removes its extracted pages and linked evidence.
 - Data stays in the project-local runtime directory unless you choose another local path via `SKILLPROOF_DATA_DIR`.
@@ -69,7 +69,7 @@ python -m pip install -e ".[dev]"
 pytest
 ```
 
-The synthetic test suite covers case setup, PDF ingestion, page citations, evidence provenance, human dispositions, duplicate detection, export, and deletion. See [evaluation plan](docs/EVALUATION_PLAN.md) for quality measures beyond software tests.
+The synthetic test suite covers case setup, PDF ingestion, page citations, evidence provenance, human dispositions, duplicate detection, export, deletion, request-size limits, queue saturation, requirement lineage migration, evidence pagination, source URL validation, and partial-extraction progress. See [evaluation plan](docs/EVALUATION_PLAN.md) for quality measures beyond software tests.
 
 ## Project notes
 
@@ -80,6 +80,7 @@ The synthetic test suite covers case setup, PDF ingestion, page citations, evide
 - [Evaluation plan](docs/EVALUATION_PLAN.md)
 - [Customer discovery guide](docs/CUSTOMER_DISCOVERY_GUIDE.md)
 - [Build journal](docs/BUILD_JOURNAL.md)
+- [Edge cases and unresolved production gaps](docs/EDGE_CASES_AND_GAPS.md)
 - [Market evidence and competitor boundary](docs/MARKET_EVIDENCE.md)
 
 ## Research provenance

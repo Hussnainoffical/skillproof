@@ -7,6 +7,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -14,12 +15,12 @@ from pathlib import Path, PureWindowsPath
 from typing import Literal
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .config import MAX_UPLOAD_BYTES, UPLOAD_DIR, WORKERS, ensure_data_dirs
+from .config import MAX_CASE_STORAGE_BYTES, MAX_CONCURRENT_UPLOAD_REQUESTS, MAX_DISCREPANCY_SCAN_PAGES, MAX_DOCUMENTS_PER_CASE, MAX_EVIDENCE_PER_CASE, MAX_REQUIREMENTS_PER_CASE, MAX_TOTAL_STORAGE_BYTES, MAX_UPLOAD_BYTES, UPLOAD_DIR, WORKERS, ensure_data_dirs
 from .db import connection, initialize, row_dict
 from .processing import now_iso, page_suggestions, process_document
 
@@ -54,7 +55,7 @@ class EvidenceCreate(BaseModel):
 
 class EvidenceReview(BaseModel):
     disposition: Literal["unreviewed", "supports", "conflicts", "needs_expert", "not_relevant"]
-    reviewer_note: str = Field(default="", max_length=2000)
+    reviewer_note: str | None = Field(default=None, max_length=2000)
 
 
 class CaseUpdate(BaseModel):
@@ -74,6 +75,20 @@ def _audit(conn: sqlite3.Connection, case_id: str, action: str, object_type: str
         "INSERT INTO audit_events(id,case_id,action,object_type,object_id,details_json,created_at) VALUES(?,?,?,?,?,?,?)",
         (str(uuid.uuid4()), case_id, action, object_type, object_id, json.dumps(details or {}, ensure_ascii=False), now_iso()),
     )
+
+
+def _validate_source_url(source_url: str) -> None:
+    if not source_url:
+        return
+    if any(ord(char) < 0x21 or char == "\\" for char in source_url):
+        raise HTTPException(422, "Source URL must not contain spaces, control characters, or backslashes")
+    try:
+        parts = urlsplit(source_url)
+        port = parts.port
+    except ValueError as exc:
+        raise HTTPException(422, "Source URL is malformed") from exc
+    if parts.scheme.lower() not in {"https", "http"} or not parts.hostname or parts.username or parts.password or (port is not None and not 1 <= port <= 65535):
+        raise HTTPException(422, "Source URL must be a valid HTTP(S) URL without embedded credentials")
 
 
 def _safe_name(name: str) -> str:
@@ -131,16 +146,27 @@ async def _store_upload(upload: UploadFile, document_id: str) -> tuple[str, str,
         await upload.close()
 
 
-def _case_detail(case_id: str) -> dict:
+def _case_detail(case_id: str, evidence_limit: int | None = 50) -> dict:
     _require_case(case_id)
     with connection() as conn:
         case = dict(conn.execute("SELECT * FROM cases WHERE id=?", (case_id,)).fetchone())
-        requirements = [dict(row) for row in conn.execute("SELECT * FROM requirements WHERE case_id=? AND is_current=1 ORDER BY created_at,id", (case_id,))]
+        requirements = [dict(row) for row in conn.execute("""SELECT r.*,
+            count(e.id) AS evidence_count,
+            sum(CASE WHEN e.disposition='supports' THEN 1 ELSE 0 END) AS supported_count,
+            sum(CASE WHEN e.disposition='unreviewed' THEN 1 ELSE 0 END) AS unreviewed_count
+            FROM requirements r LEFT JOIN evidence e ON e.requirement_id=r.id
+            WHERE r.case_id=? AND r.is_current=1 GROUP BY r.id ORDER BY r.created_at,r.id""", (case_id,))]
         documents = [dict(row) for row in conn.execute("SELECT id,case_id,original_name,media_type,size_bytes,sha256,status,error_code,error_message,page_count,extracted_chars,uploaded_at FROM documents WHERE case_id=? ORDER BY uploaded_at DESC", (case_id,))]
-        evidence = [dict(row) for row in conn.execute("""SELECT e.*, d.original_name, r.title AS requirement_title, r.version AS requirement_version
+        evidence_total = conn.execute("SELECT count(*) FROM evidence WHERE case_id=?", (case_id,)).fetchone()[0]
+        evidence_pending = conn.execute("SELECT count(*) FROM evidence WHERE case_id=? AND disposition='unreviewed'", (case_id,)).fetchone()[0]
+        evidence_sql = """SELECT e.*, d.original_name, r.title AS requirement_title, r.version AS requirement_version
             FROM evidence e JOIN documents d ON d.id=e.document_id
             LEFT JOIN requirements r ON r.id=e.requirement_id
-            WHERE e.case_id=? ORDER BY e.created_at DESC""", (case_id,))]
+            WHERE e.case_id=? ORDER BY e.created_at DESC,e.id DESC"""
+        if evidence_limit is None:
+            evidence = [dict(row) for row in conn.execute(evidence_sql, (case_id,))]
+        else:
+            evidence = [dict(row) for row in conn.execute(evidence_sql + " LIMIT ?", (case_id, evidence_limit))]
         jobs = [dict(row) for row in conn.execute("SELECT j.* FROM jobs j JOIN documents d ON d.id=j.document_id WHERE d.case_id=? ORDER BY j.created_at DESC LIMIT 30", (case_id,))]
         events = [dict(row) for row in conn.execute("SELECT action,object_type,object_id,details_json,created_at FROM audit_events WHERE case_id=? ORDER BY created_at DESC LIMIT 30", (case_id,))]
     for event in events:
@@ -148,10 +174,11 @@ def _case_detail(case_id: str) -> dict:
             event["details"] = json.loads(event.pop("details_json"))
         except json.JSONDecodeError:
             event["details"] = {}
-    return {"case": case, "requirements": requirements, "documents": documents, "evidence": evidence, "jobs": jobs, "events": events}
+    cursor = {"created_at": evidence[-1]["created_at"], "id": evidence[-1]["id"]} if evidence_limit is not None and evidence_total > len(evidence) and evidence else None
+    return {"case": case, "requirements": requirements, "documents": documents, "evidence": evidence, "evidence_total": evidence_total, "evidence_pending": evidence_pending, "evidence_cursor": cursor, "jobs": jobs, "events": events}
 
 
-def _potential_discrepancies(case_id: str) -> list[dict]:
+def _potential_discrepancies(case_id: str) -> tuple[list[dict], int, bool]:
     """Find only label-keyed, cross-file text differences for a person to inspect."""
     aliases = {
         "name": "name", "full name": "name", "candidate name": "name", "student name": "name",
@@ -161,29 +188,34 @@ def _potential_discrepancies(case_id: str) -> list[dict]:
         "training period": "training_period", "study period": "training_period", "period of study": "training_period",
     }
     pattern = re.compile(r"^\s*([A-Za-z][A-Za-z /-]{1,45})\s*[:–—-]\s*(.{2,180})\s*$")
+    fields: dict[str, dict[str, dict]] = {}
+    pages_scanned = 0
+    truncated = False
     with connection() as conn:
-        rows = conn.execute("SELECT d.id AS document_id,d.original_name,p.page_number,p.text FROM pages p JOIN documents d ON d.id=p.document_id WHERE d.case_id=? AND d.status IN ('ready','partial','needs_ocr') ORDER BY d.uploaded_at,p.page_number", (case_id,)).fetchall()
-    fields: dict[str, dict[str, list[dict]]] = {}
-    for row in rows:
-        for line in row["text"].splitlines():
-            match = pattern.match(line.strip())
-            if not match:
-                continue
-            key = aliases.get(match.group(1).strip().lower())
-            value = " ".join(match.group(2).split())[:180]
-            if key and value:
-                fields.setdefault(key, {}).setdefault(row["document_id"], []).append({"document_id": row["document_id"], "document_name": row["original_name"], "page_number": row["page_number"], "value": value})
+        rows = conn.execute("SELECT d.id AS document_id,d.original_name,p.page_number,p.text FROM pages p JOIN documents d ON d.id=p.document_id WHERE d.case_id=? AND d.status IN ('ready','partial','needs_ocr') ORDER BY d.uploaded_at,d.id,p.page_number LIMIT ?", (case_id, MAX_DISCREPANCY_SCAN_PAGES + 1))
+        for row in rows:
+            if pages_scanned >= MAX_DISCREPANCY_SCAN_PAGES:
+                truncated = True
+                break
+            pages_scanned += 1
+            for line in row["text"].splitlines():
+                match = pattern.match(line.strip())
+                if not match:
+                    continue
+                key = aliases.get(match.group(1).strip().lower())
+                value = " ".join(match.group(2).split())[:180]
+                if key and value:
+                    fields.setdefault(key, {}).setdefault(row["document_id"], {"document_id": row["document_id"], "document_name": row["original_name"], "page_number": row["page_number"], "value": value})
     result = []
     for field, by_document in fields.items():
         if len(by_document) < 2:
             continue
         values = []
-        for items in by_document.values():
-            values.append(items[0])
+        values.extend(by_document.values())
         normalized = {re.sub(r"[^\w]", "", item["value"]).casefold() for item in values}
         if len(normalized) > 1:
             result.append({"field": field.replace("_", " "), "values": values, "status": "review_required"})
-    return result
+    return result, pages_scanned, truncated
 
 
 @asynccontextmanager
@@ -212,6 +244,69 @@ app = FastAPI(
     redoc_url=None,
 )
 app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
+
+
+class UploadBodyLimitMiddleware:
+    """Reject oversized multipart bodies before Starlette spools uploads to disk."""
+
+    # Multipart boundaries, headers, and the single file field need bounded room
+    # beyond the configured file cap. This also limits unexpected extra form fields.
+    multipart_overhead_bytes = 128 * 1024
+
+    def __init__(self, app, max_file_bytes: int = MAX_UPLOAD_BYTES, max_concurrent_uploads: int = MAX_CONCURRENT_UPLOAD_REQUESTS):
+        self.app = app
+        self.max_body_bytes = max_file_bytes + self.multipart_overhead_bytes
+        self.upload_slots = threading.BoundedSemaphore(max_concurrent_uploads)
+
+    async def __call__(self, scope, receive, send):
+        path = scope.get("path", "")
+        if scope.get("type") != "http" or scope.get("method") != "POST" or not re.fullmatch(r"/api/cases/[^/]+/documents", path):
+            await self.app(scope, receive, send)
+            return
+
+        if not self.upload_slots.acquire(blocking=False):
+            await self._reject(send, 429)
+            return
+        try:
+            headers = {key.lower(): value for key, value in scope.get("headers", [])}
+            raw_length = headers.get(b"content-length", b"")
+            if raw_length.isdigit() and int(raw_length) > self.max_body_bytes:
+                await self._reject(send, 413)
+                return
+
+            received = 0
+
+            class OversizedBody(Exception):
+                pass
+
+            async def bounded_receive():
+                nonlocal received
+                message = await receive()
+                if message.get("type") == "http.request":
+                    received += len(message.get("body", b""))
+                    if received > self.max_body_bytes:
+                        raise OversizedBody
+                return message
+
+            try:
+                await self.app(scope, bounded_receive, send)
+            except OversizedBody:
+                await self._reject(send, 413)
+        finally:
+            self.upload_slots.release()
+
+    @staticmethod
+    async def _reject(send, status_code: int):
+        message = "Upload request exceeds the configured size limit" if status_code == 413 else "Too many concurrent upload requests; retry shortly"
+        body = json.dumps({"detail": message}).encode()
+        headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]
+        if status_code == 429:
+            headers.append((b"retry-after", b"10"))
+        await send({"type": "http.response.start", "status": status_code, "headers": headers})
+        await send({"type": "http.response.body", "body": body})
+
+
+app.add_middleware(UploadBodyLimitMiddleware)
 
 
 @app.middleware("http")
@@ -253,7 +348,7 @@ def list_cases() -> list[dict]:
     with connection() as conn:
         rows = conn.execute("""SELECT c.*,
             (SELECT count(*) FROM documents d WHERE d.case_id=c.id) AS document_count,
-            (SELECT count(*) FROM requirements r WHERE r.case_id=c.id) AS requirement_count,
+            (SELECT count(*) FROM requirements r WHERE r.case_id=c.id AND r.is_current=1) AS requirement_count,
             (SELECT count(*) FROM evidence e WHERE e.case_id=c.id AND e.disposition='unreviewed') AS pending_review_count
             FROM cases c ORDER BY updated_at DESC""").fetchall()
     return [dict(row) for row in rows]
@@ -287,7 +382,7 @@ def create_demo() -> dict:
         for code, title, guidance, source_name, source_url, checked in reqs:
             rid = str(uuid.uuid4())
             req_ids.append(rid)
-            conn.execute("INSERT INTO requirements(id,case_id,code,title,guidance,source_name,source_url,source_checked_at,required,created_at) VALUES(?,?,?,?,?,?,?,?,1,?)", (rid, case_id, code, title, guidance, source_name, source_url, checked, now))
+            conn.execute("INSERT INTO requirements(id,case_id,code,title,guidance,source_name,source_url,source_checked_at,required,version,chain_id,supersedes_id,is_current,created_at) VALUES(?,?,?,?,?,?,?,?,1,1,?,'',1,?)", (rid, case_id, code, title, guidance, source_name, source_url, checked, rid, now))
         doc_ids = []
         for doc_id, filename, text in pages:
             doc_ids.append(doc_id)
@@ -309,10 +404,38 @@ def get_case(case_id: str) -> dict:
     return _case_detail(case_id)
 
 
+@app.get("/api/cases/{case_id}/evidence", tags=["evidence"])
+def list_case_evidence(case_id: str, offset: int = Query(default=0, ge=0, le=100_000), limit: int = Query(default=50, ge=1, le=100), before_created_at: str | None = Query(default=None, max_length=64), before_id: str | None = Query(default=None, max_length=64)) -> dict:
+    if bool(before_created_at) != bool(before_id):
+        raise HTTPException(422, "Both evidence cursor fields are required")
+    _require_case(case_id)
+    with connection() as conn:
+        total = conn.execute("SELECT count(*) FROM evidence WHERE case_id=?", (case_id,)).fetchone()[0]
+        evidence_sql = """SELECT e.*, d.original_name, r.title AS requirement_title, r.version AS requirement_version
+            FROM evidence e JOIN documents d ON d.id=e.document_id
+            LEFT JOIN requirements r ON r.id=e.requirement_id
+            WHERE e.case_id=?"""
+        params: tuple = (case_id,)
+        if before_created_at is not None:
+            evidence_sql += " AND (e.created_at < ? OR (e.created_at=? AND e.id < ?))"
+            params = (case_id, before_created_at, before_created_at, before_id)
+            rows = conn.execute(evidence_sql + " ORDER BY e.created_at DESC,e.id DESC LIMIT ?", (*params, limit + 1)).fetchall()
+        else:
+            rows = conn.execute(evidence_sql + " ORDER BY e.created_at DESC,e.id DESC LIMIT ? OFFSET ?", (*params, limit + 1, offset)).fetchall()
+    has_more = len(rows) > limit
+    items = [dict(row) for row in rows[:limit]]
+    cursor = {"created_at": items[-1]["created_at"], "id": items[-1]["id"]} if has_more and items else None
+    return {"items": items, "offset": offset, "limit": limit, "total": total, "has_more": has_more, "next_cursor": cursor}
+
+
 @app.get("/api/cases/{case_id}/checks", tags=["review"])
 def get_case_checks(case_id: str) -> dict:
     _require_case(case_id)
-    return {"potential_discrepancies": _potential_discrepancies(case_id), "notice": "Text-pattern differences are review prompts only. They do not establish an error, identity mismatch, fraud, or qualification outcome."}
+    differences, pages_scanned, truncated = _potential_discrepancies(case_id)
+    notice = "Text-pattern differences are review prompts only. They do not establish an error, identity mismatch, fraud, or qualification outcome."
+    if truncated:
+        notice += f" This scan inspected the first {MAX_DISCREPANCY_SCAN_PAGES:,} pages only; later pages were not checked."
+    return {"potential_discrepancies": differences, "pages_scanned": pages_scanned, "partial_scan": truncated, "notice": notice}
 
 
 @app.patch("/api/cases/{case_id}", tags=["cases"])
@@ -340,11 +463,14 @@ def delete_case(case_id: str) -> Response:
 @app.post("/api/cases/{case_id}/requirements", status_code=201, tags=["requirements"])
 def add_requirement(case_id: str, payload: RequirementCreate) -> dict:
     _require_case(case_id)
-    if payload.source_url and not payload.source_url.startswith(("https://", "http://")):
-        raise HTTPException(422, "Source URL must use HTTP or HTTPS")
+    _validate_source_url(payload.source_url.strip())
     requirement_id, now = str(uuid.uuid4()), now_iso()
     with connection() as conn:
-        conn.execute("INSERT INTO requirements(id,case_id,code,title,guidance,source_name,source_url,source_checked_at,required,version,supersedes_id,is_current,created_at) VALUES(?,?,?,?,?,?,?,?,?,1,'',1,?)", (requirement_id, case_id, payload.code.strip(), payload.title.strip(), payload.guidance.strip(), payload.source_name.strip(), payload.source_url.strip(), payload.source_checked_at.strip(), int(payload.required), now))
+        conn.execute("BEGIN IMMEDIATE")
+        current_count = conn.execute("SELECT count(*) FROM requirements WHERE case_id=? AND is_current=1", (case_id,)).fetchone()[0]
+        if current_count >= MAX_REQUIREMENTS_PER_CASE:
+            raise HTTPException(409, f"This case has reached the {MAX_REQUIREMENTS_PER_CASE}-requirement limit")
+        conn.execute("INSERT INTO requirements(id,case_id,code,title,guidance,source_name,source_url,source_checked_at,required,version,chain_id,supersedes_id,is_current,created_at) VALUES(?,?,?,?,?,?,?,?,?,1,?,'',1,?)", (requirement_id, case_id, payload.code.strip(), payload.title.strip(), payload.guidance.strip(), payload.source_name.strip(), payload.source_url.strip(), payload.source_checked_at.strip(), int(payload.required), requirement_id, now))
         conn.execute("UPDATE cases SET updated_at=? WHERE id=?", (now, case_id))
         _audit(conn, case_id, "requirement.added", "requirement", requirement_id, {"title": payload.title})
         row = conn.execute("SELECT * FROM requirements WHERE id=?", (requirement_id,)).fetchone()
@@ -354,16 +480,18 @@ def add_requirement(case_id: str, payload: RequirementCreate) -> dict:
 @app.put("/api/requirements/{requirement_id}", status_code=201, tags=["requirements"])
 def revise_requirement(requirement_id: str, payload: RequirementCreate) -> dict:
     """Create an immutable checklist revision; linked evidence keeps the prior requirement ID."""
-    if payload.source_url and not payload.source_url.startswith(("https://", "http://")):
-        raise HTTPException(422, "Source URL must use HTTP or HTTPS")
+    _validate_source_url(payload.source_url.strip())
     new_id, now = str(uuid.uuid4()), now_iso()
     with connection() as conn:
+        # Serialize concurrent edits and let the second reviewer see the
+        # first committed revision before deciding whether it is still current.
+        conn.execute("BEGIN IMMEDIATE")
         old = conn.execute("SELECT * FROM requirements WHERE id=? AND is_current=1", (requirement_id,)).fetchone()
         if old is None:
-            raise HTTPException(404, "Current requirement not found")
+            raise HTTPException(409, "This requirement has already been revised or removed; refresh its history")
         version = old["version"] + 1
         conn.execute("UPDATE requirements SET is_current=0 WHERE id=?", (requirement_id,))
-        conn.execute("INSERT INTO requirements(id,case_id,code,title,guidance,source_name,source_url,source_checked_at,required,version,supersedes_id,is_current,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", (new_id, old["case_id"], payload.code.strip(), payload.title.strip(), payload.guidance.strip(), payload.source_name.strip(), payload.source_url.strip(), payload.source_checked_at.strip(), int(payload.required), version, requirement_id, 1, now))
+        conn.execute("INSERT INTO requirements(id,case_id,code,title,guidance,source_name,source_url,source_checked_at,required,version,chain_id,supersedes_id,is_current,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (new_id, old["case_id"], payload.code.strip(), payload.title.strip(), payload.guidance.strip(), payload.source_name.strip(), payload.source_url.strip(), payload.source_checked_at.strip(), int(payload.required), version, old["chain_id"] or old["id"], requirement_id, 1, now))
         conn.execute("UPDATE cases SET updated_at=? WHERE id=?", (now, old["case_id"]))
         _audit(conn, old["case_id"], "requirement.revised", "requirement", new_id, {"supersedes_id": requirement_id, "version": version})
         row = conn.execute("SELECT * FROM requirements WHERE id=?", (new_id,)).fetchone()
@@ -373,14 +501,10 @@ def revise_requirement(requirement_id: str, payload: RequirementCreate) -> dict:
 @app.get("/api/requirements/{requirement_id}/history", tags=["requirements"])
 def requirement_history(requirement_id: str) -> list[dict]:
     with connection() as conn:
-        exists = conn.execute("SELECT id FROM requirements WHERE id=?", (requirement_id,)).fetchone()
+        exists = conn.execute("SELECT chain_id FROM requirements WHERE id=?", (requirement_id,)).fetchone()
         if exists is None:
             raise HTTPException(404, "Requirement not found")
-        rows = conn.execute("""WITH RECURSIVE chain AS (
-            SELECT * FROM requirements WHERE id=?
-            UNION ALL
-            SELECT prior.* FROM requirements prior JOIN chain current ON prior.id=current.supersedes_id
-        ) SELECT * FROM chain ORDER BY version""", (requirement_id,)).fetchall()
+        rows = conn.execute("SELECT * FROM requirements WHERE chain_id=? ORDER BY version", (exists["chain_id"],)).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -407,6 +531,20 @@ async def upload_document(case_id: str, request: Request, file: UploadFile = Fil
     display_name = _safe_name(file.filename or "uploaded-document")
     try:
         with connection() as conn:
+            # The count and insertion share a write lock. Without this, two
+            # simultaneous uploads could both pass a stale capacity check.
+            conn.execute("BEGIN IMMEDIATE")
+            active = conn.execute("SELECT count(*) FROM jobs WHERE state IN ('queued','running')").fetchone()[0]
+            if active >= max(8, WORKERS * 4):
+                raise HTTPException(429, "The local processing queue is full. Wait for current files to finish, then retry.", headers={"Retry-After": "15"})
+            case_storage = conn.execute("SELECT count(*),coalesce(sum(size_bytes),0) FROM documents WHERE case_id=?", (case_id,)).fetchone()
+            if case_storage[0] >= MAX_DOCUMENTS_PER_CASE:
+                raise HTTPException(409, f"This case has reached the {MAX_DOCUMENTS_PER_CASE}-document limit")
+            if case_storage[1] + size > MAX_CASE_STORAGE_BYTES:
+                raise HTTPException(413, "This upload exceeds the per-case storage budget")
+            total_storage = conn.execute("SELECT coalesce(sum(size_bytes),0) FROM documents").fetchone()[0]
+            if total_storage + size > MAX_TOTAL_STORAGE_BYTES:
+                raise HTTPException(413, "This upload exceeds the local workspace storage budget")
             duplicate = conn.execute("SELECT id,original_name FROM documents WHERE case_id=? AND sha256=? AND sha256!=''", (case_id, digest)).fetchone()
             if duplicate:
                 (UPLOAD_DIR / storage_name).unlink(missing_ok=True)
@@ -414,7 +552,14 @@ async def upload_document(case_id: str, request: Request, file: UploadFile = Fil
             conn.execute("INSERT INTO documents(id,case_id,original_name,storage_name,media_type,size_bytes,sha256,status,uploaded_at) VALUES(?,?,?,?,?,?,?,'queued',?)", (document_id, case_id, display_name, storage_name, media_type, size, digest, now))
             conn.execute("INSERT INTO jobs(id,document_id,state,created_at,updated_at) VALUES(?,?,'queued',?,?)", (job_id, document_id, now, now))
             _audit(conn, case_id, "document.uploaded", "document", document_id, {"bytes": size, "media_type": media_type, "sha256": digest})
-        request.app.state.pool.submit(process_document, document_id, job_id)
+        try:
+            request.app.state.pool.submit(process_document, document_id, job_id)
+        except RuntimeError:
+            with connection() as conn:
+                conn.execute("UPDATE documents SET status='failed',error_code='PROCESSING_QUEUE_UNAVAILABLE',error_message='The local worker pool stopped before this file could be queued.' WHERE id=?", (document_id,))
+                conn.execute("UPDATE jobs SET state='failed',error_code='PROCESSING_QUEUE_UNAVAILABLE',updated_at=? WHERE id=?", (now_iso(), job_id))
+                _audit(conn, case_id, "document.queue_failed", "document", document_id, {"code": "PROCESSING_QUEUE_UNAVAILABLE"})
+            return {"document_id": document_id, "job_id": job_id, "state": "failed", "error_code": "PROCESSING_QUEUE_UNAVAILABLE", "max_upload_bytes": MAX_UPLOAD_BYTES}
     except Exception:
         (UPLOAD_DIR / storage_name).unlink(missing_ok=True)
         raise
@@ -483,6 +628,7 @@ def document_source(document_id: str, page: int = 1) -> FileResponse:
 def add_evidence(case_id: str, payload: EvidenceCreate) -> dict:
     _require_case(case_id)
     with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         doc = conn.execute("SELECT case_id FROM documents WHERE id=?", (payload.document_id,)).fetchone()
         if doc is None or doc["case_id"] != case_id:
             raise HTTPException(404, "Document not found in this case")
@@ -504,6 +650,12 @@ def add_evidence(case_id: str, payload: EvidenceCreate) -> dict:
         quote = " ".join(payload.claim_text.split())
         if quote not in " ".join(page["text"].split()):
             raise HTTPException(422, "Evidence text must be an exact excerpt from the selected source page")
+        duplicate = conn.execute("SELECT id FROM evidence WHERE case_id=? AND document_id=? AND page_number=? AND requirement_id IS ? AND region_id=? AND claim_text=? LIMIT 1", (case_id, payload.document_id, payload.page_number, payload.requirement_id, payload.region_id, quote)).fetchone()
+        if duplicate:
+            raise HTTPException(409, "This exact excerpt is already linked to this requirement and source region")
+        evidence_count = conn.execute("SELECT count(*) FROM evidence WHERE case_id=?", (case_id,)).fetchone()[0]
+        if evidence_count >= MAX_EVIDENCE_PER_CASE:
+            raise HTTPException(409, f"This case has reached the {MAX_EVIDENCE_PER_CASE:,}-evidence-item limit")
         evidence_id, now = str(uuid.uuid4()), now_iso()
         conn.execute("INSERT INTO evidence(id,case_id,requirement_id,document_id,page_number,region_id,claim_type,claim_text,provenance,disposition,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'unreviewed',?,?)", (evidence_id, case_id, payload.requirement_id, payload.document_id, payload.page_number, payload.region_id, payload.claim_type, quote, payload.provenance, now, now))
         conn.execute("UPDATE cases SET updated_at=? WHERE id=?", (now, case_id))
@@ -519,8 +671,9 @@ def review_evidence(evidence_id: str, payload: EvidenceReview) -> dict:
         if row is None:
             raise HTTPException(404, "Evidence item not found")
         now = now_iso()
-        provenance = "human_verified" if payload.disposition in {"supports", "conflicts", "needs_expert", "not_relevant"} else row["provenance"]
-        conn.execute("UPDATE evidence SET disposition=?,reviewer_note=?,provenance=?,updated_at=? WHERE id=?", (payload.disposition, payload.reviewer_note.strip(), provenance, now, evidence_id))
+        provenance = "human_verified" if payload.disposition in {"supports", "conflicts", "needs_expert", "not_relevant"} else ("human_observed" if row["provenance"] == "human_verified" else row["provenance"])
+        note = row["reviewer_note"] if payload.reviewer_note is None else payload.reviewer_note.strip()
+        conn.execute("UPDATE evidence SET disposition=?,reviewer_note=?,provenance=?,updated_at=? WHERE id=?", (payload.disposition, note, provenance, now, evidence_id))
         _audit(conn, row["case_id"], "evidence.reviewed", "evidence", evidence_id, {"disposition": payload.disposition})
         result = conn.execute("SELECT * FROM evidence WHERE id=?", (evidence_id,)).fetchone()
     return dict(result)
@@ -533,7 +686,7 @@ def _md(value: str) -> str:
 
 @app.get("/api/cases/{case_id}/packet.md", tags=["export"])
 def export_packet(case_id: str) -> Response:
-    detail = _case_detail(case_id)
+    detail = _case_detail(case_id, evidence_limit=None)
     case = detail["case"]
     lines = [
         f"# Human-reviewed qualification evidence packet: {_md(case['title'])}",

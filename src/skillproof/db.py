@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS requirements (
     source_checked_at TEXT NOT NULL DEFAULT '',
     required INTEGER NOT NULL DEFAULT 1,
     version INTEGER NOT NULL DEFAULT 1,
+    chain_id TEXT NOT NULL DEFAULT '',
     supersedes_id TEXT NOT NULL DEFAULT '',
     is_current INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL
@@ -100,10 +101,15 @@ CREATE TABLE IF NOT EXISTS audit_events (
 );
 CREATE INDEX IF NOT EXISTS idx_requirements_case ON requirements(case_id);
 CREATE INDEX IF NOT EXISTS idx_documents_case ON documents(case_id);
+CREATE INDEX IF NOT EXISTS idx_documents_case_uploaded ON documents(case_id,uploaded_at DESC);
 CREATE INDEX IF NOT EXISTS idx_pages_document ON pages(document_id, page_number);
 CREATE INDEX IF NOT EXISTS idx_evidence_case ON evidence(case_id, requirement_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_requirement ON evidence(requirement_id);
+CREATE INDEX IF NOT EXISTS idx_evidence_case_created ON evidence(case_id,created_at DESC,id DESC);
+CREATE INDEX IF NOT EXISTS idx_evidence_case_disposition ON evidence(case_id,disposition);
 CREATE INDEX IF NOT EXISTS idx_jobs_state ON jobs(state, created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_case ON audit_events(case_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_cases_updated ON cases(updated_at DESC);
 """
 
 
@@ -133,12 +139,42 @@ def initialize() -> None:
         existing = {row[1] for row in conn.execute("PRAGMA table_info(requirements)")}
         for name, definition in (
             ("version", "INTEGER NOT NULL DEFAULT 1"),
+            ("chain_id", "TEXT NOT NULL DEFAULT ''"),
             ("supersedes_id", "TEXT NOT NULL DEFAULT ''"),
             ("is_current", "INTEGER NOT NULL DEFAULT 1"),
         ):
             if name not in existing:
                 conn.execute(f"ALTER TABLE requirements ADD COLUMN {name} {definition}")
+        # Backfill a stable lineage key so each requirement history can have only
+        # one current revision, including databases created before this constraint.
+        rows = conn.execute("SELECT id,case_id,supersedes_id,chain_id FROM requirements").fetchall()
+        by_id = {row["id"]: row for row in rows}
+        for row in rows:
+            if row["chain_id"]:
+                continue
+            current_id = row["id"]
+            visited: set[str] = set()
+            while current_id not in visited:
+                visited.add(current_id)
+                current = by_id.get(current_id)
+                if current is None or not current["supersedes_id"]:
+                    break
+                parent = by_id.get(current["supersedes_id"])
+                if parent is None or parent["case_id"] != row["case_id"]:
+                    break
+                current_id = parent["id"]
+            root_id = min(visited) if current_id in visited else current_id
+            conn.execute("UPDATE requirements SET chain_id=? WHERE id=?", (root_id, row["id"]))
+        # Repair any old fork caused by a previous concurrent-edit race by
+        # keeping the newest revision current and retaining the rest as history.
+        chains = conn.execute("SELECT chain_id FROM requirements WHERE is_current=1 GROUP BY chain_id HAVING count(*)>1").fetchall()
+        for chain in chains:
+            current_rows = conn.execute("SELECT id FROM requirements WHERE chain_id=? AND is_current=1 ORDER BY version DESC,created_at DESC,id DESC", (chain["chain_id"],)).fetchall()
+            for stale in current_rows[1:]:
+                conn.execute("UPDATE requirements SET is_current=0 WHERE id=?", (stale["id"],))
         conn.execute("CREATE INDEX IF NOT EXISTS idx_requirements_current ON requirements(case_id,is_current)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_requirements_chain ON requirements(chain_id,version)")
+        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_requirements_one_current_per_chain ON requirements(chain_id) WHERE is_current=1")
 
 
 def row_dict(row: sqlite3.Row | None) -> dict | None:

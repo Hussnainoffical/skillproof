@@ -1,6 +1,6 @@
 # Build journal
 
-**Build date:** 2026-10-28 · **Project:** SkillProof local review MVP
+**Build date:** 2026-10-29 · **Project:** SkillProof local review MVP
 
 ## Phase 0 — scope and stop conditions
 
@@ -19,6 +19,12 @@ Implemented case creation/status, manual official-source checklist entries, PDF/
 ## Phase 3 — safeguards and verification
 
 Implemented source-page quote validation, visible limitations, HTML escaping, same-origin/local binding, loopback host checks, security headers, no external model or analytics calls, synthetic-only demo data, and human-only disposition controls. The synthetic demo includes a deliberately different institution string; it exercises the cross-document prompt without presenting it as a factual error. Eight automated API tests cover the primary lifecycle, a 63-page multi-batch PDF, legacy database migration, requirement history, and unsafe input boundaries. Verification: `python -m pytest` — 8 passed; Python compile check passed; `node --check` passed; local browser dashboard, demo case, discrepancy prompt, and source-page inspector opened successfully.
+
+## Phase 3.1 — resilience edge cases
+
+The next review found that the upload body could be spooled before the endpoint enforced its file limit, simultaneous uploads could race through the queue check, a requirement lineage could acquire multiple current revisions, and layout fragments had no explicit per-page memory bound. Added a streaming ASGI request cap for known and unknown content lengths, concurrent upload admission control, per-case/workspace storage quotas, transactional queue admission, one-current-revision-per-lineage schema enforcement with migration backfill, full-chain history lookup, and per-page region count/character caps. Fixed case-list counts to exclude historical checklist revisions and made job progress report pages actually processed when extraction stops at a text budget. Case evidence now uses bounded, stable-cursor pages with separate summary counts; the cross-document scan streams database rows and discloses when it reaches its configured page budget. Added idempotent excerpt duplicate rejection, source URL credential/malformed-host validation, and note-preserving review reopen behavior.
+
+Verification for this increment: `python -m pytest -q` — 17 passed; `python -m compileall -q src tests`; `node --check src/skillproof/static/app.js`; `python -m pip check`. These tests validate local correctness only; they are not adversarial parser fuzzing, a legal/privacy review, or a scale benchmark. See [edge cases and unresolved production gaps](EDGE_CASES_AND_GAPS.md) for the next risk-based work list.
 
 ## Phase 4 — next increments
 

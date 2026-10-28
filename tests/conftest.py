@@ -14,4 +14,3 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "UPLOAD_DIR", uploads)
     with TestClient(main.app) as test_client:
         yield test_client
-
